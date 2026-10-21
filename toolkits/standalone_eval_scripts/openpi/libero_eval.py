@@ -16,9 +16,11 @@ import collections
 import math
 import os
 import pathlib
+import random
 
 import imageio
 import numpy as np
+import torch
 import tqdm
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -77,6 +79,9 @@ def main(args):
 
     # Set random seed
     np.random.seed(args.seed)
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -103,6 +108,16 @@ def main(args):
     policy = setup_policy(args)
     logger.info("policy setup done")
 
+    action_noise_shape = None
+    if args.action_noise_seed is not None:
+        action_noise_shape = (
+            policy._model.config.action_horizon,
+            policy._model.config.action_dim,
+        )
+        logger.info(
+            f"Using fixed action noise seed {args.action_noise_seed} with shape {action_noise_shape}"
+        )
+
     # Start evaluation
     total_episodes, total_successes = 0, 0
     results_per_task = {}
@@ -127,6 +142,7 @@ def main(args):
             policy.reset()
             env.reset()
             action_plan = collections.deque()
+            replan_idx = 0
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
@@ -166,8 +182,22 @@ def main(args):
                         "observation/state": state,
                         "prompt": str(task_description),
                     }
+                    noise = None
+                    if action_noise_shape is not None:
+                        noise_seed = (
+                            args.action_noise_seed
+                            + task_id * 1_000_000
+                            + episode_idx * 10_000
+                            + replan_idx
+                        )
+                        noise_rng = np.random.default_rng(noise_seed)
+                        noise = noise_rng.normal(
+                            size=action_noise_shape
+                        ).astype(np.float32)
+                        replan_idx += 1
+
                     # infer the action
-                    action_chunk = policy.infer(observation)["actions"]
+                    action_chunk = policy.infer(observation, noise=noise)["actions"]
 
                     assert len(action_chunk) >= args.action_chunk, (
                         f"We want to replan every {args.action_chunk} steps, but policy only predicts {len(action_chunk)} steps."
@@ -309,6 +339,12 @@ if __name__ == "__main__":
         type=int,
         default=7,
         help="Random seed (for reproducibility)",
+    )
+    parser.add_argument(
+        "--action_noise_seed",
+        type=int,
+        default=None,
+        help="Seed for deterministic flow/diffusion action initial noise. If None, uses stochastic policy sampling.",
     )
     args = parser.parse_args()
     main(args)

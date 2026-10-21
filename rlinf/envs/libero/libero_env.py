@@ -96,6 +96,9 @@ class LiberoEnv(gym.Env):
         self.task_id_filter = cfg.get("task_id_filter", None)
         if self.task_id_filter is not None:
             self.task_id_filter = list(self.task_id_filter)
+        self.reset_state_id_filter = cfg.get("reset_state_id_filter", None)
+        if self.reset_state_id_filter is not None:
+            self.reset_state_id_filter = list(self.reset_state_id_filter)
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -104,8 +107,12 @@ class LiberoEnv(gym.Env):
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
         self.start_idx = 0
+        self._ordered_reset_state_cache = {}
 
         self.task_suite: Benchmark = get_benchmark_overridden(cfg.task_suite_name)()
+        self.teacher_suite_name_to_id = self._build_teacher_suite_name_to_id(
+            cfg.get("teacher_suite_groups", None)
+        )
 
         self._compute_total_num_group_envs()
         self.reset_state_ids_all = self.get_reset_state_ids_all()
@@ -114,6 +121,7 @@ class LiberoEnv(gym.Env):
             self._eval_reset_pool = pool[pool >= 0].copy()
         else:
             self._eval_reset_pool = np.array([], dtype=np.int64)
+        self._sync_ordered_reset_state_cache()
         self.update_reset_state_ids()
         self._init_task_and_trial_ids()
         self._init_env()
@@ -127,6 +135,69 @@ class LiberoEnv(gym.Env):
 
         self.video_cfg = cfg.video_cfg
         self.current_raw_obs = None
+
+    def _build_teacher_suite_name_to_id(self, teacher_suite_groups):
+        if teacher_suite_groups is None:
+            return None
+
+        suite_name_to_teacher_id = {}
+        for teacher_id, suite_group in enumerate(teacher_suite_groups):
+            for suite_name in suite_group:
+                suite_key = str(suite_name).lower()
+                if suite_key in suite_name_to_teacher_id:
+                    raise ValueError(
+                        f"Duplicate teacher routing for suite `{suite_key}`."
+                    )
+                suite_name_to_teacher_id[suite_key] = teacher_id
+        return suite_name_to_teacher_id
+
+    def _get_task_source_suite_name(self, task_id: int) -> str:
+        task = self.task_suite.get_task(int(task_id))
+        return str(task.problem_folder).lower()
+
+    def _get_teacher_ids(self):
+        if self.teacher_suite_name_to_id is None:
+            return None
+
+        teacher_ids = []
+        for task_id in self.task_ids:
+            suite_name = self._get_task_source_suite_name(task_id)
+            if suite_name not in self.teacher_suite_name_to_id:
+                raise ValueError(
+                    "No teacher routing configured for current task suite "
+                    f"`{suite_name}`."
+                )
+            teacher_ids.append(self.teacher_suite_name_to_id[suite_name])
+
+        return torch.as_tensor(teacher_ids, dtype=torch.long)
+
+    def _make_reset_state_cache_key(
+        self, task_id_filter: Optional[list[int]] = None
+    ) -> tuple[int, ...] | None:
+        if task_id_filter is None:
+            task_id_filter = self.task_id_filter
+        if task_id_filter is None:
+            return None
+        return tuple(int(task_id) for task_id in task_id_filter)
+
+    def _sync_ordered_reset_state_cache(self):
+        cache_key = self._make_reset_state_cache_key()
+        self._ordered_reset_state_cache[cache_key] = {
+            "reset_state_ids_all": self.reset_state_ids_all.copy(),
+            "start_idx": int(self.start_idx),
+        }
+
+    def _load_or_create_ordered_reset_state_cache(self):
+        cache_key = self._make_reset_state_cache_key()
+        cached_state = self._ordered_reset_state_cache.get(cache_key, None)
+        if cached_state is None:
+            self.start_idx = 0
+            self.reset_state_ids_all = self.get_reset_state_ids_all()
+            self._sync_ordered_reset_state_cache()
+            return
+
+        self.start_idx = int(cached_state["start_idx"])
+        self.reset_state_ids_all = cached_state["reset_state_ids_all"].copy()
 
     def _init_env(self):
         env_fns = self.get_env_fns()
@@ -398,12 +469,66 @@ class LiberoEnv(gym.Env):
         else:
             self._valid_reset_state_ids = None
 
+        if self.reset_state_id_filter is not None:
+            explicit_reset_ids = []
+            for reset_state_id in self.reset_state_id_filter:
+                if not isinstance(reset_state_id, (int, np.integer)):
+                    raise ValueError(
+                        "reset_state_id_filter must contain ints, got "
+                        f"{type(reset_state_id).__name__}: {reset_state_id}"
+                    )
+                reset_state_id = int(reset_state_id)
+                if reset_state_id < 0 or reset_state_id >= self.total_num_group_envs:
+                    raise ValueError(
+                        f"reset_state_id {reset_state_id} is out of range "
+                        f"[0, {self.total_num_group_envs - 1}]"
+                    )
+                explicit_reset_ids.append(reset_state_id)
+
+            # Preserve caller order so a coverage retry can deterministically
+            # resume from its missing-ID manifest.
+            explicit_reset_ids = list(dict.fromkeys(explicit_reset_ids))
+            if self._valid_reset_state_ids is not None:
+                allowed_ids = set(self._valid_reset_state_ids.tolist())
+                outside_task_filter = [
+                    reset_state_id
+                    for reset_state_id in explicit_reset_ids
+                    if reset_state_id not in allowed_ids
+                ]
+                if outside_task_filter:
+                    raise ValueError(
+                        "reset_state_id_filter contains IDs outside task_id_filter: "
+                        f"{outside_task_filter[:10]}"
+                    )
+            self._valid_reset_state_ids = np.asarray(
+                explicit_reset_ids, dtype=np.int64
+            )
+
     def update_reset_state_ids(self):
         if self.is_eval or self.cfg.use_ordered_reset_state_ids:
             reset_state_ids = self._get_ordered_reset_state_ids(self.num_group)
         else:
             reset_state_ids = self._get_random_reset_state_ids(self.num_group)
         self.reset_state_ids = reset_state_ids.repeat(self.group_size)
+
+    def apply_rollout_schedule(
+        self,
+        *,
+        task_id_filter: Optional[list[int]] = None,
+        max_episode_steps: Optional[int] = None,
+    ):
+        if task_id_filter is None:
+            self.task_id_filter = None
+        else:
+            self.task_id_filter = [int(task_id) for task_id in task_id_filter]
+
+        if max_episode_steps is not None:
+            self.cfg.max_episode_steps = int(max_episode_steps)
+
+        self._compute_total_num_group_envs()
+        self._load_or_create_ordered_reset_state_cache()
+        self.update_reset_state_ids()
+        self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
 
     def _init_task_and_trial_ids(self):
         self.task_ids, self.trial_ids = (
@@ -476,10 +601,12 @@ class LiberoEnv(gym.Env):
         if self.start_idx + num_reset_states > len(self.reset_state_ids_all[0]):
             self.reset_state_ids_all = self.get_reset_state_ids_all()
             self.start_idx = 0
+            self._sync_ordered_reset_state_cache()
         reset_state_ids = self.reset_state_ids_all[self.seed_offset][
             self.start_idx : self.start_idx + num_reset_states
         ]
         self.start_idx = self.start_idx + num_reset_states
+        self._sync_ordered_reset_state_cache()
         return reset_state_ids
 
     def _get_task_and_trial_ids_from_reset_state_ids(self, reset_state_ids):
@@ -613,7 +740,16 @@ class LiberoEnv(gym.Env):
             "wrist_images": wrist_image_tensor,
             "states": states,
             "task_descriptions": self.task_descriptions,
+            # ``reset_state_ids`` is mutated in-place by auto-reset.  A tensor
+            # view created with ``as_tensor`` would retroactively change every
+            # observation already collected in the current action chunk.
+            "reset_state_ids": torch.tensor(
+                self.reset_state_ids, dtype=torch.long
+            ),
         }
+        teacher_ids = self._get_teacher_ids()
+        if teacher_ids is not None:
+            obs["teacher_ids"] = teacher_ids
         return obs
 
     def _reconfigure(self, reset_state_ids, env_idx):
@@ -667,6 +803,8 @@ class LiberoEnv(gym.Env):
             num_reset_states = len(env_idx)
             reset_state_ids = self._get_random_reset_state_ids(num_reset_states)
 
+        reset_state_ids = np.asarray(reset_state_ids, dtype=np.int64)
+        self.reset_state_ids[np.asarray(env_idx)] = reset_state_ids
         self._reconfigure(reset_state_ids, env_idx)
         for _ in range(15):
             zero_actions = np.zeros((len(env_idx), 7))

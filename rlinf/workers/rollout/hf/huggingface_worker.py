@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import os
 import time
 from typing import Any, Callable, Literal, Optional
 
@@ -43,6 +44,11 @@ class MultiStepRolloutWorker(Worker):
 
         self.only_eval = cfg.runner.get("only_eval", False)
         self.algorithm_cfg = cfg.get("algorithm", {})
+        if str(self.algorithm_cfg.get("loss_type", "")) == "embodied_opd":
+            if self.algorithm_cfg.get("opd_occupancy", {}).get("enabled", False):
+                raise ValueError("Release OPD supports only online Student rollouts; set opd_occupancy.enabled=false.")
+            if cfg.rollout.get("expert_model", None) is not None:
+                raise ValueError("Release OPD uses the Student to act; configure target policies under algorithm.opd_teachers.")
         self.model_cfg = cfg.rollout.model if self.only_eval else cfg.actor.model
         self.actor_group_name = (
             cfg.actor.get("group_name", None)
@@ -99,6 +105,16 @@ class MultiStepRolloutWorker(Worker):
             if self.enable_train
             else 0
         )
+        self.train_rollout_epoch_chunk_steps_schedule = (
+            self._build_train_rollout_epoch_chunk_steps_schedule()
+            if self.enable_train
+            else []
+        )
+        self.train_rollout_epoch_episode_chunk_steps_schedule = (
+            self._build_train_rollout_epoch_episode_chunk_steps_schedule()
+            if self.enable_train
+            else []
+        )
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
             self.n_eval_chunk_steps = (
@@ -129,6 +145,95 @@ class MultiStepRolloutWorker(Worker):
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
 
+    def _should_enable_rollout_epoch_schedule(self) -> bool:
+        if self.algorithm_cfg.get("rollout_epoch_schedule", None) is None:
+            return False
+
+        return str(self.algorithm_cfg.get("loss_type", "")) == "embodied_opd"
+
+    def _build_train_rollout_epoch_chunk_steps_schedule(self) -> list[int]:
+        raw_schedule = self.algorithm_cfg.get("rollout_epoch_schedule", None)
+        if raw_schedule is None or not self._should_enable_rollout_epoch_schedule():
+            return []
+
+        schedule: list[int] = []
+        for block_idx, raw_block in enumerate(raw_schedule):
+            block_cfg = OmegaConf.to_container(raw_block, resolve=True)
+            if "max_steps_per_rollout_epoch" not in block_cfg:
+                raise ValueError(
+                    "Each rollout_epoch_schedule block must set max_steps_per_rollout_epoch."
+                )
+
+            max_steps_per_rollout_epoch = int(block_cfg["max_steps_per_rollout_epoch"])
+            if (
+                max_steps_per_rollout_epoch
+                % self.model_cfg.num_action_chunks
+                != 0
+            ):
+                raise ValueError(
+                    "rollout_epoch_schedule["
+                    f"{block_idx}].max_steps_per_rollout_epoch="
+                    f"{max_steps_per_rollout_epoch} must be divisible by "
+                    f"actor.model.num_action_chunks={self.model_cfg.num_action_chunks}."
+                )
+
+            schedule.append(
+                max_steps_per_rollout_epoch // self.model_cfg.num_action_chunks
+            )
+
+        rollout_epoch = int(self.rollout_epoch)
+        if len(schedule) == rollout_epoch:
+            return schedule
+
+        if rollout_epoch % len(schedule) != 0:
+            raise ValueError(
+                "env.train.rollout_epoch must either match rollout_epoch_schedule "
+                "length or be an integer multiple of it: "
+                f"{rollout_epoch} vs {len(schedule)}."
+            )
+
+        return schedule * (rollout_epoch // len(schedule))
+
+    def _get_train_chunk_steps_for_epoch(self, epoch: int) -> int:
+        if not self.train_rollout_epoch_chunk_steps_schedule:
+            return self.n_train_chunk_steps
+        return int(self.train_rollout_epoch_chunk_steps_schedule[epoch])
+
+    def _build_train_rollout_epoch_episode_chunk_steps_schedule(self) -> list[int]:
+        """Return fixed OPD episode rows from suite max episode steps."""
+        raw_schedule = self.algorithm_cfg.get("rollout_epoch_schedule", None)
+        chunk_size = int(self.model_cfg.num_action_chunks)
+        if raw_schedule is None or not self._should_enable_rollout_epoch_schedule():
+            max_episode_steps = int(self.cfg.env.train.max_episode_steps)
+            return [max(1, (max_episode_steps + chunk_size - 1) // chunk_size)] * int(
+                self.rollout_epoch
+            )
+
+        schedule = []
+        for block_idx, raw_block in enumerate(raw_schedule):
+            block_cfg = OmegaConf.to_container(raw_block, resolve=True)
+            max_episode_steps = int(
+                block_cfg.get("max_episode_steps", block_cfg["max_steps_per_rollout_epoch"])
+            )
+            if max_episode_steps <= 0:
+                raise ValueError(
+                    f"rollout_epoch_schedule[{block_idx}].max_episode_steps must be positive."
+                )
+            schedule.append(max(1, (max_episode_steps + chunk_size - 1) // chunk_size))
+
+        if len(schedule) == self.rollout_epoch:
+            return schedule
+        if self.rollout_epoch % len(schedule) != 0:
+            raise ValueError(
+                "env.train.rollout_epoch must either match rollout_epoch_schedule "
+                "length or be an integer multiple of it: "
+                f"{self.rollout_epoch} vs {len(schedule)}."
+            )
+        return schedule * (self.rollout_epoch // len(schedule))
+
+    def _get_train_episode_chunk_steps_for_epoch(self, epoch: int) -> int:
+        return int(self.train_rollout_epoch_episode_chunk_steps_schedule[epoch])
+
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
         with open_dict(rollout_model_config):
@@ -153,6 +258,7 @@ class MultiStepRolloutWorker(Worker):
             if self.cfg.runner.get("expert_ckpt_path", None):
                 expert_model_dict = torch.load(self.cfg.runner.expert_ckpt_path)
                 self.expert_model.load_state_dict(expert_model_dict)
+
 
         self.hf_model.eval()
         if self.expert_model is not None:
@@ -484,9 +590,62 @@ class MultiStepRolloutWorker(Worker):
                 f"Beta schedule {self._dagger_sampling_params['beta_schedule']} is not implemented"
             )
 
+
+    @staticmethod
+    def _to_cpu_nested(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().contiguous()
+        if isinstance(value, dict):
+            return {key: MultiStepRolloutWorker._to_cpu_nested(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [MultiStepRolloutWorker._to_cpu_nested(item) for item in value]
+        return value
+
+
+    @staticmethod
+    def _replace_rows(
+        base: Any, replacement: Any, mask: torch.Tensor
+    ) -> Any:
+        """Replace selected batch rows with cached rows recursively."""
+        if isinstance(base, torch.Tensor) and isinstance(replacement, torch.Tensor):
+            if base.ndim == 0 or base.shape[0] != mask.numel():
+                return base
+            indices = torch.nonzero(mask, as_tuple=False).flatten()
+            if indices.numel() == 0:
+                return base
+            output = base.clone()
+            output.index_copy_(
+                0,
+                indices.to(output.device),
+                replacement.index_select(0, indices.to(replacement.device)).to(
+                    device=output.device, dtype=output.dtype
+                ),
+            )
+            return output
+        if isinstance(base, dict) and isinstance(replacement, dict):
+            return {
+                key: MultiStepRolloutWorker._replace_rows(
+                    base_value, replacement.get(key, base_value), mask
+                )
+                for key, base_value in base.items()
+            }
+        if isinstance(base, list) and isinstance(replacement, list):
+            if len(base) != mask.numel() or len(replacement) != mask.numel():
+                return base
+            output = list(base)
+            for index in torch.nonzero(mask, as_tuple=False).flatten().tolist():
+                output[index] = replacement[index]
+            return output
+        return base
+
+
+
+
     @Worker.timer("predict")
     def predict(
-        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
+        self,
+        env_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = (
             self._train_sampling_params
@@ -633,16 +792,67 @@ class MultiStepRolloutWorker(Worker):
         self.torch_platform.empty_cache()
 
     @Worker.timer("generate_one_epoch")
-    async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
+    async def generate_one_epoch(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        n_train_chunk_steps: int | None = None,
+    ):
         self.update_dagger_beta()
-        for _ in range(self.n_train_chunk_steps):
-            for _ in range(self.num_pipeline_stages):
+        if n_train_chunk_steps is None:
+            n_train_chunk_steps = self.n_train_chunk_steps
+        local_batch_size = int(
+            getattr(self, "per_node_train_batch_size", self.train_batch_size)
+        )
+        inactive_masks = [
+            torch.zeros(local_batch_size, dtype=torch.bool)
+            for _ in range(self.num_pipeline_stages)
+        ]
+        last_actions: list[torch.Tensor | None] = [None] * self.num_pipeline_stages
+        last_results: list[dict[str, Any] | None] = [None] * self.num_pipeline_stages
+
+        for _ in range(n_train_chunk_steps):
+            for stage_idx in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(
                     input_channel=input_channel,
                     tag="train_rollout_results",
                     batch_size=self.train_batch_size,
                 )
+                env_dones = env_output.get("dones", None)
+                if env_dones is not None:
+                    inactive_masks[stage_idx] |= env_dones.any(dim=-1).cpu()
                 actions, result = self.predict(env_output["obs"])
+                padding_mask = inactive_masks[stage_idx]
+                if (
+                    padding_mask.any()
+                    and last_actions[stage_idx] is not None
+                    and last_results[stage_idx] is not None
+                ):
+                    actions = self._replace_rows(
+                        actions,
+                        last_actions[stage_idx],
+                        padding_mask,
+                    )
+                    result["forward_inputs"] = self._replace_rows(
+                        result["forward_inputs"],
+                        last_results[stage_idx]["forward_inputs"],
+                        padding_mask,
+                    )
+                    for result_key in ("prev_logprobs", "prev_values"):
+                        if result.get(result_key) is not None:
+                            result[result_key] = self._replace_rows(
+                                result[result_key],
+                                last_results[stage_idx].get(result_key),
+                                padding_mask,
+                            )
+                last_actions[stage_idx] = actions.detach().cpu().contiguous()
+                last_results[stage_idx] = self._to_cpu_nested(
+                    {
+                        "forward_inputs": result["forward_inputs"],
+                        "prev_logprobs": result.get("prev_logprobs"),
+                        "prev_values": result.get("prev_values"),
+                    }
+                )
 
                 save_flags = None
                 if result.get("expert_label_flag", False):
@@ -665,10 +875,14 @@ class MultiStepRolloutWorker(Worker):
                     ),
                     save_flags=save_flags,
                     forward_inputs=result["forward_inputs"],
-                    versions=torch.full_like(
-                        result["prev_logprobs"],
-                        float(self.version),
-                        dtype=torch.float32,
+                    versions=(
+                        torch.full_like(
+                            result["prev_logprobs"],
+                            float(self.version),
+                            dtype=torch.float32,
+                        )
+                        if result.get("prev_logprobs") is not None
+                        else None
                     ),
                 )
                 self.send_rollout_result(
@@ -678,13 +892,39 @@ class MultiStepRolloutWorker(Worker):
                     batch_size=self.train_batch_size,
                     split_fn=self._split_rollout_result,
                 )
-        for _ in range(self.num_pipeline_stages):
+        for stage_idx in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(
                 input_channel=input_channel,
                 tag="train_rollout_results",
                 batch_size=self.train_batch_size,
             )
+            env_dones = env_output.get("dones", None)
+            if env_dones is not None:
+                inactive_masks[stage_idx] |= env_dones.any(dim=-1).cpu()
             actions, result = self.predict(env_output["obs"])
+            padding_mask = inactive_masks[stage_idx]
+            if (
+                padding_mask.any()
+                and last_actions[stage_idx] is not None
+                and last_results[stage_idx] is not None
+            ):
+                actions = self._replace_rows(
+                    actions,
+                    last_actions[stage_idx],
+                    padding_mask,
+                )
+                result["forward_inputs"] = self._replace_rows(
+                    result["forward_inputs"],
+                    last_results[stage_idx]["forward_inputs"],
+                    padding_mask,
+                )
+                for result_key in ("prev_logprobs", "prev_values"):
+                    if result.get(result_key) is not None:
+                        result[result_key] = self._replace_rows(
+                            result[result_key],
+                            last_results[stage_idx].get(result_key),
+                            padding_mask,
+                        )
 
             rollout_result = RolloutResult(
                 actions=actions,
@@ -692,6 +932,7 @@ class MultiStepRolloutWorker(Worker):
                 bootstrap_values=self.get_bootstrap_values(
                     env_output.get("final_obs", None)
                 ),
+                forward_inputs=result["forward_inputs"],
             )
             self.send_rollout_result(
                 output_channel=output_channel,
@@ -715,7 +956,13 @@ class MultiStepRolloutWorker(Worker):
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            await self.generate_one_epoch(input_channel, output_channel)
+            n_train_chunk_steps = self._get_train_chunk_steps_for_epoch(_)
+            await self.generate_one_epoch(
+                input_channel,
+                output_channel,
+                n_train_chunk_steps=n_train_chunk_steps,
+
+            )
 
         if self.enable_offload:
             self.offload_model()
@@ -834,8 +1081,18 @@ class MultiStepRolloutWorker(Worker):
                 for obs_dict, final_obs in zip(obs_dicts, final_obs_list)
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
+        dones = [obs_batch.get("dones", None) for obs_batch in obs_batches]
+        merged_dones = None
+        if any(done is not None for done in dones):
+            if any(done is None for done in dones):
+                raise ValueError("Inconsistent env output: some shards omit dones.")
+            merged_dones = torch.cat(dones, dim=0)
 
-        return {"obs": merged_obs, "final_obs": merged_final_obs}
+        return {
+            "obs": merged_obs,
+            "final_obs": merged_final_obs,
+            "dones": merged_dones,
+        }
 
     def _split_rollout_result(
         self, rollout_result: RolloutResult, sizes: list[int]
@@ -864,7 +1121,6 @@ class MultiStepRolloutWorker(Worker):
                 for idx in range(len(sizes))
             ]
         )
-
         return [
             RolloutResult(
                 actions=split_actions[idx],

@@ -107,6 +107,14 @@ class EnvWorker(Worker):
             train_env_cfg.rollout_epoch if train_env_cfg is not None else 1
         )
         self.eval_rollout_epoch = eval_env_cfg.rollout_epoch if self.enable_eval else 1
+        self.train_rollout_epoch_schedule = (
+            self._build_train_rollout_epoch_schedule() if self.enable_train else []
+        )
+        self.actor_dst_ranks = (
+            self._setup_actor_dst_ranks()
+            if self.train_rollout_epoch_schedule
+            else []
+        )
 
         self.train_enable_offload = (
             train_env_cfg.get("enable_offload", False)
@@ -167,6 +175,104 @@ class EnvWorker(Worker):
             ) >= self._component_placement.get_world_size("rollout"), (
                 "the world size of env must be greater than the world size of rollout in env_decoupled_mode"
             )
+
+    def _should_enable_rollout_epoch_schedule(self) -> bool:
+        if self.cfg.algorithm.get("rollout_epoch_schedule", None) is None:
+            return False
+
+        return str(self.cfg.algorithm.loss_type) == "embodied_opd"
+
+    def _build_train_rollout_epoch_schedule(self) -> list[dict[str, Any]]:
+        raw_schedule = self.cfg.algorithm.get("rollout_epoch_schedule", None)
+        if raw_schedule is None or not self._should_enable_rollout_epoch_schedule():
+            return []
+
+        schedule: list[dict[str, Any]] = []
+        for block_idx, raw_block in enumerate(raw_schedule):
+            block_cfg = OmegaConf.to_container(raw_block, resolve=True)
+            if "max_steps_per_rollout_epoch" not in block_cfg:
+                raise ValueError(
+                    "Each rollout_epoch_schedule block must set max_steps_per_rollout_epoch."
+                )
+
+            max_steps_per_rollout_epoch = int(block_cfg["max_steps_per_rollout_epoch"])
+            if (
+                max_steps_per_rollout_epoch
+                % self.model_cfg.num_action_chunks
+                != 0
+            ):
+                raise ValueError(
+                    "rollout_epoch_schedule["
+                    f"{block_idx}].max_steps_per_rollout_epoch="
+                    f"{max_steps_per_rollout_epoch} must be divisible by "
+                    f"actor.model.num_action_chunks={self.model_cfg.num_action_chunks}."
+                )
+
+            max_episode_steps = int(
+                block_cfg.get("max_episode_steps", max_steps_per_rollout_epoch)
+            )
+            task_id_filter = block_cfg.get("task_id_filter", None)
+            if task_id_filter is not None:
+                task_id_filter = [int(task_id) for task_id in task_id_filter]
+
+            schedule.append(
+                {
+                    "name": str(block_cfg.get("name", f"block_{block_idx}")),
+                    "task_id_filter": task_id_filter,
+                    "max_episode_steps": max_episode_steps,
+                    "max_steps_per_rollout_epoch": max_steps_per_rollout_epoch,
+                }
+            )
+
+        rollout_epoch = int(self.rollout_epoch)
+        if len(schedule) == rollout_epoch:
+            return schedule
+
+        if rollout_epoch % len(schedule) != 0:
+            raise ValueError(
+                "env.train.rollout_epoch must either match rollout_epoch_schedule "
+                "length or be an integer multiple of it: "
+                f"{rollout_epoch} vs {len(schedule)}."
+            )
+
+        schedule = schedule * (rollout_epoch // len(schedule))
+
+        return schedule
+
+    def _apply_train_rollout_epoch_block(self, epoch: int) -> int:
+        if not self.train_rollout_epoch_schedule:
+            return self.n_train_chunk_steps
+
+        block_cfg = self.train_rollout_epoch_schedule[epoch]
+        max_episode_steps = int(block_cfg["max_episode_steps"])
+        max_steps_per_rollout_epoch = int(block_cfg["max_steps_per_rollout_epoch"])
+
+        setattr(self.cfg.env.train, "max_episode_steps", max_episode_steps)
+        setattr(
+            self.cfg.env.train,
+            "max_steps_per_rollout_epoch",
+            max_steps_per_rollout_epoch,
+        )
+
+        for stage_id in range(self.stage_num):
+            env = self.env_list[stage_id]
+            if not hasattr(env, "apply_rollout_schedule"):
+                raise ValueError(
+                    "algorithm.rollout_epoch_schedule requires envs that implement "
+                    "`apply_rollout_schedule()`."
+                )
+            env.apply_rollout_schedule(
+                task_id_filter=block_cfg.get("task_id_filter", None),
+                max_episode_steps=max_episode_steps,
+            )
+            set_video_sub_dir = get_env_attr(env, "set_video_sub_dir")
+            if callable(set_video_sub_dir):
+                set_video_sub_dir(block_cfg["name"])
+
+        return max_steps_per_rollout_epoch // self.model_cfg.num_action_chunks
+
+    def _get_scheduled_actor_channel_key(self, dst_rank: int) -> str:
+        return f"scheduled_actor_rank_{dst_rank}"
 
     def init_worker(self):
         # This is a barrier to ensure all envs' initial setup upon import is done
@@ -367,9 +473,129 @@ class EnvWorker(Worker):
                     finalize_interval=getattr(
                         env_cfg.data_collection, "finalize_interval", 100
                     ),
+                    group_by_reset_state_id=getattr(
+                        env_cfg.data_collection,
+                        "group_by_reset_state_id",
+                        False,
+                    ),
                 )
             env_list.append(env)
         return env_list
+
+    def _setup_dst_rank_map(self) -> dict[str, list[tuple[int, int]]]:
+        """Compute destination rank map for this env worker.
+
+        This mapping supports both one-to-many and many-to-one env/rollout/reward layouts.
+        The returned ranks are used as communication counterparts for both sending
+        env outputs and receiving results from rollout and reward workers.
+
+        Returns:
+            Destination rank map for this env worker.
+            The key is the channel name (e.g. "rollout_train", "reward_train", "rollout_eval"), and the value is a ordered list of tuples of (dst_rank, batch_size).
+        """
+        dst_rank_map = {}
+        if not self.only_eval:
+            dst_rank_map = {
+                "rollout_train": CommMapper.get_dst_ranks(
+                    batch_size=self.cfg.env.train.total_num_envs // self.stage_num,
+                    src_world_size=self._component_placement.get_world_size("env"),
+                    dst_world_size=self._component_placement.get_world_size("rollout"),
+                    src_rank=self._rank,
+                ),
+            }
+            if self.cfg.get("reward", {}).get("use_reward_model", False):
+                dst_rank_map.update(
+                    {
+                        "reward_train": CommMapper.get_dst_ranks(
+                            batch_size=self.cfg.env.train.total_num_envs
+                            // self.stage_num,
+                            src_world_size=self._component_placement.get_world_size(
+                                "env"
+                            ),
+                            dst_world_size=self._component_placement.get_world_size(
+                                "reward"
+                            ),
+                            src_rank=self._rank,
+                        ),
+                    }
+                )
+
+        if self.enable_eval:
+            dst_rank_map.update(
+                {
+                    "rollout_eval": CommMapper.get_dst_ranks(
+                        batch_size=self.cfg.env.eval.total_num_envs // self.stage_num,
+                        src_world_size=self._component_placement.get_world_size("env"),
+                        dst_world_size=self._component_placement.get_world_size(
+                            "rollout"
+                        ),
+                        src_rank=self._rank,
+                    ),
+                }
+            )
+        return dst_rank_map
+
+    def _setup_src_rank_map(self) -> dict[str, list[tuple[int, int]]]:
+        """Compute source rank map for this env worker.
+
+        This mapping supports both one-to-many and many-to-one env/rollout/reward layouts.
+        The returned ranks are used as communication counterparts for both receiving results from rollout and reward workers and sending action chunks.
+
+        Returns:
+            Source rank map for this env worker.
+            The key is the channel name (e.g. "rollout_train", "reward_train", "rollout_eval"), and the value is a ordered list of tuples of (src_rank, batch_size).
+        """
+        src_rank_map = {}
+        if not self.only_eval:
+            src_rank_map = {
+                "rollout_train": CommMapper.get_src_ranks(
+                    batch_size=self.cfg.env.train.total_num_envs // self.stage_num,
+                    src_world_size=self._component_placement.get_world_size("rollout"),
+                    dst_world_size=self._component_placement.get_world_size("env"),
+                    dst_rank=self._rank,
+                ),
+            }
+            if self.cfg.get("reward", {}).get("use_reward_model", False):
+                src_rank_map.update(
+                    {
+                        "reward_train": CommMapper.get_src_ranks(
+                            batch_size=self.cfg.env.train.total_num_envs
+                            // self.stage_num,
+                            src_world_size=self._component_placement.get_world_size(
+                                "reward"
+                            ),
+                            dst_world_size=self._component_placement.get_world_size(
+                                "env"
+                            ),
+                            dst_rank=self._rank,
+                        ),
+                    }
+                )
+        if self.enable_eval:
+            src_rank_map.update(
+                {
+                    "rollout_eval": CommMapper.get_src_ranks(
+                        batch_size=self.cfg.env.eval.total_num_envs // self.stage_num,
+                        src_world_size=self._component_placement.get_world_size(
+                            "rollout"
+                        ),
+                        dst_world_size=self._component_placement.get_world_size("env"),
+                        dst_rank=self._rank,
+                    ),
+                }
+            )
+        return src_rank_map
+
+    def _setup_actor_dst_ranks(self) -> list[int]:
+        actor_world_size = self._component_placement.get_world_size("actor")
+        env_world_size = self._component_placement.get_world_size("env")
+        dst_ranks_and_sizes = CommMapper.get_dst_ranks(
+            batch_size=self.cfg.env.train.total_num_envs // self.stage_num,
+            src_world_size=env_world_size,
+            dst_world_size=actor_world_size,
+            src_rank=self._rank,
+        )
+        return [rank for rank, _ in dst_ranks_and_sizes]
 
     def _init_env(self):
         for i in range(self.stage_num):
@@ -664,7 +890,12 @@ class EnvWorker(Worker):
                     flush_video = get_env_attr(self.env_list[i], "flush_video")
                     if callable(flush_video):
                         flush_video()
-                self.env_list[i].update_reset_state_ids()
+                # A scheduled epoch applies its next suite and allocates the
+                # corresponding IDs atomically at the next epoch boundary.
+                # Advancing here would consume an unused batch of IDs and, with
+                # auto-reset enabled, detach metadata from the live observation.
+                if not self.train_rollout_epoch_schedule:
+                    self.env_list[i].update_reset_state_ids()
         elif mode == "eval":
             for i in range(self.stage_num):
                 if self.cfg.env.eval.video_cfg.save_video:
@@ -771,7 +1002,14 @@ class EnvWorker(Worker):
         )
         return sparse_rewards
 
-    def assign_history_reward(self, stage_id: int, reward_model_output: torch.Tensor):
+    def assign_history_reward(
+        self,
+        stage_id: int,
+        reward_model_output: torch.Tensor,
+        rollout_results: list[EmbodiedRolloutResult] | None = None,
+    ):
+        if rollout_results is None:
+            rollout_results = self.rollout_results
         reward_assign_lengths = [
             min(
                 history_buffer_length[env_id]
@@ -779,7 +1017,7 @@ class EnvWorker(Worker):
             )
             for env_id in range(self.train_num_envs_per_stage)
         ]
-        rollout_rewards = self.rollout_results[stage_id].rewards
+        rollout_rewards = rollout_results[stage_id].rewards
         rollout_rewards_length = len(rollout_rewards)
         reward_assign_lengths = [
             min(reward_assign_length, rollout_rewards_length)
@@ -795,7 +1033,16 @@ class EnvWorker(Worker):
                 rollout_rewards[-reward_assign_step][env_id] += reward[env_id]
 
     @Worker.timer("env/bootstrap_step")
-    def bootstrap_step(self) -> list[EnvOutput]:
+    def bootstrap_step(self, *, force_reset: bool = False) -> list[EnvOutput]:
+        """Build the initial observation batch for one rollout epoch.
+
+        Args:
+            force_reset: Reset every physical slot even when training auto-reset
+                is enabled. Scheduled multi-suite OPD uses this after applying a
+                suite block so observations and reset-state metadata cannot
+                straddle an epoch boundary.
+        """
+
         def get_zero_dones() -> torch.Tensor:
             return (
                 torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
@@ -804,7 +1051,7 @@ class EnvWorker(Worker):
             )
 
         env_outputs: list[EnvOutput] = []
-        if not self.cfg.env.train.auto_reset:
+        if force_reset or not self.cfg.env.train.auto_reset:
             for stage_id in range(self.stage_num):
                 self.env_list[stage_id].is_start = True
                 extracted_obs, infos = self.env_list[stage_id].reset()
@@ -857,14 +1104,20 @@ class EnvWorker(Worker):
                 data={
                     "obs": env_batch["obs"],
                     "final_obs": env_batch["final_obs"],
+                    "dones": env_batch["dones"],
                 },
                 mode="train",
                 tag="rollout_results",
                 decoupled_mode=self.env_decoupled_mode,
             )
 
-    def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
-        env_outputs = self.bootstrap_step()
+    def _bootstrap_and_send_train(
+        self,
+        rollout_channel: Channel,
+        *,
+        force_reset: bool = False,
+    ) -> list[EnvOutput]:
+        env_outputs = self.bootstrap_step(force_reset=force_reset)
         self._send_train_bootstrap(rollout_channel, env_outputs)
         return env_outputs
 
@@ -896,14 +1149,31 @@ class EnvWorker(Worker):
 
     @Worker.timer("env/send_rollout_trajectories")
     async def send_rollout_trajectories(
-        self, rollout_result: EmbodiedRolloutResult, channel: Channel
+        self,
+        rollout_result: EmbodiedRolloutResult,
+        channel: Channel,
+        rollout_block_idx: int | None = None,
     ):
         trajectories: list[Trajectory] = rollout_result.to_splited_trajectories(
             self.actor_split_num
         )
+        if rollout_block_idx is not None:
+            for trajectory in trajectories:
+                trajectory.rollout_block_idx = int(rollout_block_idx)
         rollout_result.clear()
-        for trajectory in trajectories:
-            channel.put(trajectory, async_op=True)
+        if self.train_rollout_epoch_schedule:
+            assert len(trajectories) == len(self.actor_dst_ranks), (
+                f"{len(trajectories)=} != {len(self.actor_dst_ranks)=}"
+            )
+            for trajectory, dst_rank in zip(trajectories, self.actor_dst_ranks):
+                channel.put(
+                    trajectory,
+                    key=self._get_scheduled_actor_channel_key(dst_rank),
+                    async_op=True,
+                )
+        else:
+            for trajectory in trajectories:
+                channel.put(trajectory, async_op=True)
         del trajectories
         gc.collect()
 
@@ -926,15 +1196,38 @@ class EnvWorker(Worker):
         env_metrics = defaultdict(list)
 
         for epoch in range(self.rollout_epoch):
-            env_outputs = self.bootstrap_step()
-            for stage_id in range(self.stage_num):
-                if epoch == 0 and self._prefetched_train_bootstrap is not None:
-                    env_outputs = self._prefetched_train_bootstrap
-                    self._prefetched_train_bootstrap = None
-                else:
-                    env_outputs = self._bootstrap_and_send_train(rollout_channel)
+            block_n_train_chunk_steps = self._apply_train_rollout_epoch_block(epoch)
+            if self.train_rollout_epoch_schedule:
+                block_cfg = self.train_rollout_epoch_schedule[epoch]
+                block_rollout_results = [
+                    EmbodiedRolloutResult(
+                        max_episode_length=int(block_cfg["max_episode_steps"]),
+                    )
+                    for _ in range(self.stage_num)
+                ]
+            else:
+                block_rollout_results = self.rollout_results
 
-            for chunk_step_idx in range(self.n_train_chunk_steps):
+            if self.train_rollout_epoch_schedule:
+                if self._prefetched_train_bootstrap is not None:
+                    raise RuntimeError(
+                        "Prefetched bootstrap is incompatible with scheduled "
+                        "rollout epoch force-reset boundaries."
+                    )
+                # apply_rollout_schedule() has selected the suite and allocated
+                # a fresh full batch of IDs. Reset every physical slot before
+                # exposing observations to Rollout so buffer lookup uses the
+                # exact state that produced each image.
+                env_outputs = self._bootstrap_and_send_train(
+                    rollout_channel, force_reset=True
+                )
+            elif epoch == 0 and self._prefetched_train_bootstrap is not None:
+                env_outputs = self._prefetched_train_bootstrap
+                self._prefetched_train_bootstrap = None
+            else:
+                env_outputs = self._bootstrap_and_send_train(rollout_channel)
+
+            for chunk_step_idx in range(block_n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
                     if cooperative_yield:
                         await asyncio.sleep(0)
@@ -942,7 +1235,7 @@ class EnvWorker(Worker):
                     env_output = env_outputs[stage_id]
                     curr_obs = env_output.obs
                     if env_output.intervene_actions is not None:
-                        self.rollout_results[stage_id].update_last_actions(
+                        block_rollout_results[stage_id].update_last_actions(
                             env_output.intervene_actions,
                             env_output.intervene_flags,
                         )
@@ -991,15 +1284,21 @@ class EnvWorker(Worker):
                         terminations=env_output.terminations,
                         rewards=rewards,
                     )
-                    self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                    block_rollout_results[stage_id].append_step_result(
+                        chunk_step_result
+                    )
                     if (
                         self.reward_mode == "history_buffer"
                         and self.history_reward_assign
                         and reward_model_output is not None
                     ):
-                        self.assign_history_reward(stage_id, reward_model_output)
+                        self.assign_history_reward(
+                            stage_id,
+                            reward_model_output,
+                            rollout_results=block_rollout_results,
+                        )
                     if rollout_result.save_flags is not None:
-                        self.rollout_results[stage_id].mark_last_step_with_flags(
+                        block_rollout_results[stage_id].mark_last_step_with_flags(
                             rollout_result.save_flags
                         )
 
@@ -1013,6 +1312,7 @@ class EnvWorker(Worker):
                         data={
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            "dones": env_batch["dones"],
                         },
                         mode="train",
                         tag="rollout_results",
@@ -1024,7 +1324,12 @@ class EnvWorker(Worker):
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
                             else env_output.obs
                         )
-                        self.rollout_results[stage_id].append_transitions(
+                        target_rollout_results = (
+                            block_rollout_results
+                            if self.train_rollout_epoch_schedule
+                            else self.rollout_results
+                        )
+                        target_rollout_results[stage_id].append_transitions(
                             curr_obs, next_obs
                         )
 
@@ -1032,14 +1337,14 @@ class EnvWorker(Worker):
                     should_record = (
                         self.cfg.env.train.auto_reset
                         or self.cfg.env.train.ignore_terminations
-                        or chunk_step_idx == self.n_train_chunk_steps - 1
+                        or chunk_step_idx == block_n_train_chunk_steps - 1
                     )
                     if should_record:
                         self.record_env_metrics(env_metrics, env_info)
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
                 if env_output.intervene_actions is not None:
-                    self.rollout_results[stage_id].update_last_actions(
+                    block_rollout_results[stage_id].update_last_actions(
                         env_output.intervene_actions,
                         env_output.intervene_flags,
                     )
@@ -1079,15 +1384,27 @@ class EnvWorker(Worker):
                     terminations=env_output.terminations,
                     rewards=rewards,
                 )
-                self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                block_rollout_results[stage_id].append_step_result(chunk_step_result)
                 if (
                     self.reward_mode == "history_buffer"
                     and self.history_reward_assign
                     and reward_model_output is not None
                 ):
-                    self.assign_history_reward(stage_id, reward_model_output)
+                    self.assign_history_reward(
+                        stage_id,
+                        reward_model_output,
+                        rollout_results=block_rollout_results,
+                    )
 
-            if self.use_training_pipeline and actor_channel is not None:
+            if self.train_rollout_epoch_schedule:
+                if actor_channel is not None:
+                    for stage_id in range(self.stage_num):
+                        await self.send_rollout_trajectories(
+                            block_rollout_results[stage_id],
+                            actor_channel,
+                            rollout_block_idx=epoch,
+                        )
+            elif self.use_training_pipeline and actor_channel is not None:
                 await self.send_rollout_trajectories_pipeline(
                     self.rollout_results, actor_channel
                 )
@@ -1101,7 +1418,11 @@ class EnvWorker(Worker):
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
 
-        if not self.use_training_pipeline and actor_channel is not None:
+        if (
+            not self.train_rollout_epoch_schedule
+            and not self.use_training_pipeline
+            and actor_channel is not None
+        ):
             for stage_id in range(self.stage_num):
                 await self.send_rollout_trajectories(
                     self.rollout_results[stage_id], actor_channel

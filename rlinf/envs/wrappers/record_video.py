@@ -75,6 +75,7 @@ class RecordVideo(gym.Wrapper):
         self.video_cfg = video_cfg
         self.render_images: list[np.ndarray] = []
         self.video_cnt = 0
+        self.video_sub_dir = getattr(video_cfg, "video_sub_dir", None)
         self._num_envs = getattr(env, "num_envs", 1)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._save_futures: list[Future] = []
@@ -452,6 +453,7 @@ class RecordVideo(gym.Wrapper):
         output_dir = os.path.join(
             self.video_cfg.video_base_dir, f"seed_{self.env.seed}"
         )
+        video_sub_dir = video_sub_dir or self.video_sub_dir
         if video_sub_dir is not None:
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
 
@@ -464,6 +466,10 @@ class RecordVideo(gym.Wrapper):
         # Block until the encode + writer.close() returns so the MP4 is valid
         # on disk before the rollout loop continues (or the process exits).
         future.result()
+
+    def set_video_sub_dir(self, video_sub_dir: Optional[str]) -> None:
+        """Set the suite directory used by the next flushed training video."""
+        self.video_sub_dir = video_sub_dir
 
     def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> Future:
         """Submit a background job to save the video, return its Future."""

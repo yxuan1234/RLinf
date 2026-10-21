@@ -51,12 +51,15 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     checkpoint_dir = download.maybe_download(str(cfg.model_path))
 
     # Check if this is a checkpoint directory (saved by FSDP)
+    # OPD checkpoints are restored after PEFT injection; model_path stays the
+    # original SFT base model.
+    restore_dir = download.maybe_download(str(cfg.get("checkpoint_path"))) if cfg.get("checkpoint_path") else checkpoint_dir
     # Check for model_state_dict/full_weights.pt (direct checkpoint) or actor/model_state_dict/full_weights.pt (from runner)
     full_weights_path = os.path.join(
-        checkpoint_dir, "model_state_dict", "full_weights.pt"
+        restore_dir, "model_state_dict", "full_weights.pt"
     )
     actor_full_weights_path = os.path.join(
-        checkpoint_dir, "actor", "model_state_dict", "full_weights.pt"
+        restore_dir, "actor", "model_state_dict", "full_weights.pt"
     )
 
     model: OpenPi0ForRLActionPrediction = OpenPi0ForRLActionPrediction(
@@ -99,7 +102,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, data_config.asset_id)
+        norm_stats_dir = getattr(cfg.openpi, "norm_stats_dir", None)
+        norm_stats = _checkpoints.load_norm_stats(
+            str(norm_stats_dir) if norm_stats_dir else checkpoint_dir,
+            data_config.asset_id,
+        )
     # wrappers
     repack_transforms = transforms.Group()
     default_prompt = None

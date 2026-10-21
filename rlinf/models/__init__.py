@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from typing import Callable, Optional
 
 from omegaconf import DictConfig
+import torch
 
 from rlinf.config import EMBODIED_MODEL, SupportedModel, torch_dtype_from_precision
 from rlinf.scheduler import Worker
 
 ModelBuilder = Callable[[DictConfig, Optional[object]], object]
 _MODEL_REGISTRY: dict[str, ModelBuilder] = {}
+logger = logging.getLogger(__name__)
 
 
 def register_model(
@@ -258,28 +262,50 @@ def get_model(cfg: DictConfig):
         from peft import LoraConfig, PeftModel, get_peft_model
 
         if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
+            lora_scope = cfg.get("lora_scope", "all")
+            if lora_scope not in ("all", "language_model"):
+                raise ValueError(
+                    f"Unsupported lora_scope={lora_scope!r}; expected 'all' or "
+                    "'language_model'."
+                )
+            # The language-only OpenPI setup used by OPD training adapts the
+            # Gemma attention and MLP projections, and nothing else.
+            language_model_target_modules = [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ]
+            lora_target_modules = list(language_model_target_modules)
+            if lora_scope == "all":
+                lora_target_modules.extend(
+                    [
+                        "proj",
+                        "qkv",
+                        "fc1",
+                        "fc2",  # vision
+                        "q",
+                        "kv",
+                        "fc3",
+                        "out_proj",  # projector
+                        "lm_head",
+                    ]
+                )
             lora_config = LoraConfig(
                 r=cfg.lora_rank,
                 lora_alpha=cfg.lora_rank,
                 lora_dropout=0.0,
-                target_modules=[
-                    "proj",
-                    "qkv",
-                    "fc1",
-                    "fc2",  # vision
-                    "q",
-                    "kv",
-                    "fc3",
-                    "out_proj",  # project
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                    "lm_head",  # llm
-                ],
+                target_modules=lora_target_modules,
+                # This is a second guard against matching similarly named
+                # modules in SigLIP when language-only LoRA is requested.
+                exclude_modules=(
+                    r".*vision_tower.*"
+                    if lora_scope == "language_model"
+                    else None
+                ),
                 init_lora_weights="gaussian",
             )
             if SupportedModel(model_type) in (
@@ -291,6 +317,7 @@ def get_model(cfg: DictConfig):
                 tag_vlm_subtree(model, False)
                 tag_vlm_subtree(module_to_lora, True)
                 model.paligemma_with_expert.paligemma = module_to_lora
+                _reload_fsdp_checkpoint_after_lora(model, cfg)
             else:
                 model = get_peft_model(model, lora_config)
         else:
@@ -300,7 +327,81 @@ def get_model(cfg: DictConfig):
             for param in model.value_head.parameters():
                 param.requires_grad = True
 
+    if cfg.get("merge_lora_for_eval", False):
+        if not cfg.is_lora:
+            raise ValueError("merge_lora_for_eval requires is_lora=True.")
+        if SupportedModel(model_type) != SupportedModel.OPENPI:
+            raise ValueError("merge_lora_for_eval currently supports OpenPI only.")
+        _merge_openpi_lora_for_eval(model)
+
     return model
+
+
+def _reload_fsdp_checkpoint_after_lora(model, cfg: DictConfig) -> None:
+    """Load FSDP full_weights again after PEFT LoRA modules are attached.
+
+    The OpenPI model builder loads checkpoint weights before the generic LoRA
+    wrapper in this module is applied. For FSDP checkpoints that contain LoRA
+    tensors, e.g. ``*.lora_A.default.weight``, those keys are ignored by the
+    pre-LoRA ``strict=False`` load. Reloading after PEFT injection restores the
+    trained adapter weights while keeping normal base-model initialization
+    unchanged when ``model_path`` is not an FSDP checkpoint.
+    """
+
+    checkpoint_dir = str(cfg.get("checkpoint_path") or cfg.model_path)
+    full_weights_candidates = [
+        os.path.join(checkpoint_dir, "model_state_dict", "full_weights.pt"),
+        os.path.join(checkpoint_dir, "actor", "model_state_dict", "full_weights.pt"),
+    ]
+    for full_weights_path in full_weights_candidates:
+        if os.path.exists(full_weights_path):
+            model_state_dict = torch.load(full_weights_path, map_location="cpu")
+            checkpoint_lora_keys = {
+                key for key in model_state_dict if ".lora_" in key
+            }
+            if cfg.get("merge_lora_for_eval", False) and not checkpoint_lora_keys:
+                raise ValueError(
+                    "The evaluation checkpoint contains no LoRA tensors. "
+                    "For an already merged model, set is_lora=False and "
+                    "merge_lora_for_eval=False."
+                )
+            model_keys = set(model.state_dict())
+            unmatched_lora_keys = checkpoint_lora_keys - model_keys
+            if unmatched_lora_keys:
+                sample = sorted(unmatched_lora_keys)[:5]
+                raise RuntimeError(
+                    f"LoRA checkpoint structure does not match the model: "
+                    f"{len(unmatched_lora_keys)}/{len(checkpoint_lora_keys)} "
+                    f"adapter tensors are unmatched. Examples: {sample}. "
+                    "Check is_lora, lora_rank, and lora_scope."
+                )
+            model.load_state_dict(model_state_dict, strict=False)
+            if checkpoint_lora_keys:
+                logger.info(
+                    "Restored %d LoRA tensors from %s",
+                    len(checkpoint_lora_keys),
+                    full_weights_path,
+                )
+            return
+
+    if cfg.get("checkpoint_path"):
+        raise FileNotFoundError(
+            f"No FSDP full_weights.pt found in {checkpoint_dir}. "
+            "Set checkpoint_path to the checkpoint root or its actor directory."
+        )
+
+
+def _merge_openpi_lora_for_eval(model) -> None:
+    """Merge the nested VLM adapter after restoring its trained FSDP weights."""
+    from peft import PeftModel
+
+    vlm = model.paligemma_with_expert.paligemma
+    if not isinstance(vlm, PeftModel):
+        raise ValueError("Expected an OpenPI VLM PEFT adapter before merging.")
+    model.paligemma_with_expert.paligemma = vlm.merge_and_unload(safe_merge=True)
+    model.requires_grad_(False)
+    model.eval()
+    logger.info("Merged OpenPI VLM LoRA for evaluation; all parameters are frozen.")
 
 
 def tag_vlm_subtree(model, is_vlm: bool):

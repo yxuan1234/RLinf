@@ -118,6 +118,7 @@ class CollectEpisode(gym.Wrapper):
         only_success: bool = False,
         finalize_interval: int = 100,
         resume: bool = False,
+        group_by_reset_state_id: bool = False,
     ):
         if isinstance(env, gym.Env):
             super().__init__(env)
@@ -139,6 +140,7 @@ class CollectEpisode(gym.Wrapper):
         self.fps = fps
         self.only_success = only_success
         self.finalize_interval = finalize_interval
+        self.group_by_reset_state_id = group_by_reset_state_id
 
         self._preexisting_episode_count = 0
         self._next_shard_id = 0
@@ -347,6 +349,7 @@ class CollectEpisode(gym.Wrapper):
         if has_final_obs:
             final_observation = info["final_observation"]
             final_info_batch = info["final_info"]
+            final_count_mask = info.get("_final_info", None)
             info_no_reset = copy.deepcopy(info)
             info_no_reset.pop("final_observation")
             info_no_reset.pop("final_info")
@@ -361,6 +364,10 @@ class CollectEpisode(gym.Wrapper):
             if has_final_obs and env_done:
                 env_obs = self._slice_copy(final_observation, env_idx)
                 env_info = self._slice_copy(final_info_batch, env_idx)
+                if final_count_mask is not None:
+                    env_info["_collect_episode_counted"] = self._scalar_flag(
+                        final_count_mask, env_idx
+                    )
                 self._pending_obs[env_idx] = self._slice_copy(obs, env_idx)
                 self._pending_info[env_idx] = self._slice_copy(info_no_reset, env_idx)
                 if "intervene_action" in env_info:
@@ -427,6 +434,19 @@ class CollectEpisode(gym.Wrapper):
             is_success = self._get_episode_success(self._buffers[env_idx], env_idx)
             done_by_term = self._scalar_flag(terminated, env_idx)
             done_by_trunc = self._scalar_flag(truncated, env_idx)
+            last_info = (
+                self._buffers[env_idx]["infos"][-1]
+                if self._buffers[env_idx]["infos"]
+                else {}
+            )
+            completion_counted = (
+                last_info.get("_collect_episode_counted", True)
+                if isinstance(last_info, dict)
+                else True
+            )
+            if (done_by_term or done_by_trunc) and not completion_counted:
+                self._reset_env_buffer(env_idx)
+                continue
             if self.only_success:
                 if is_success and done_by_term:
                     self._flush_episode(env_idx, is_success)
@@ -451,6 +471,12 @@ class CollectEpisode(gym.Wrapper):
             if ep_data is not None:
                 self._submit(self._write_lerobot_episode, ep_data)
         else:
+            reset_state_id = self._extract_episode_scalar(
+                buf, "reset_state_ids", required=self.group_by_reset_state_id
+            )
+            teacher_id = self._extract_episode_scalar(
+                buf, "teacher_ids", required=False
+            )
             episode_data = self._copy(
                 {
                     "rank": self.rank,
@@ -458,6 +484,8 @@ class CollectEpisode(gym.Wrapper):
                     "episode_id": self._episode_ids[env_idx],
                     "step": self._global_step,
                     "success": is_success,
+                    "reset_state_id": reset_state_id,
+                    "teacher_id": teacher_id,
                     "observations": buf["observations"],
                     "actions": buf["actions"],
                     "rewards": buf["rewards"],
@@ -473,9 +501,54 @@ class CollectEpisode(gym.Wrapper):
                 f"step_{self._global_step}_"
                 f"{label}.pkl"
             )
+            episode_save_dir = self.save_dir
+            if self.group_by_reset_state_id:
+                episode_save_dir = os.path.join(
+                    self.save_dir, f"reset_state_{reset_state_id:06d}"
+                )
+                os.makedirs(episode_save_dir, exist_ok=True)
             self._submit(
-                self._write_pickle, os.path.join(self.save_dir, filename), episode_data
+                self._write_pickle,
+                os.path.join(episode_save_dir, filename),
+                episode_data,
             )
+
+    @staticmethod
+    def _extract_episode_scalar(
+        buf: dict, key: str, *, required: bool
+    ) -> Optional[int]:
+        values = []
+        for obs in buf["observations"]:
+            if not isinstance(obs, dict) or obs.get(key) is None:
+                continue
+            value = obs[key]
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise ValueError(
+                        f"Expected scalar observation field {key}, got {value.shape}."
+                    )
+                value = value.item()
+            elif isinstance(value, np.ndarray):
+                if value.size != 1:
+                    raise ValueError(
+                        f"Expected scalar observation field {key}, got {value.shape}."
+                    )
+                value = value.reshape(-1)[0]
+            values.append(int(value))
+
+        if not values:
+            if required:
+                raise ValueError(
+                    f"Cannot group collected episodes because observation field "
+                    f"{key!r} is missing."
+                )
+            return None
+        if any(value != values[0] for value in values[1:]):
+            raise ValueError(
+                f"Observation field {key!r} changed within one episode: "
+                f"{sorted(set(values))}."
+            )
+        return values[0]
 
     def _buffer_to_lerobot_ep(
         self, buf: dict, env_idx: int, is_success: bool

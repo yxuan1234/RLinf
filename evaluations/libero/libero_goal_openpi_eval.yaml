@@ -1,7 +1,8 @@
 defaults:
-  - env/libero_goal@env.eval
-  - model/pi0@rollout.model
-  - override hydra/job_logging: stdout
+  - /env/libero_goal@env.eval
+  - /model/pi0@rollout.model
+  - override /hydra/job_logging: stdout
+  - _self_
 
 hydra:
   run:

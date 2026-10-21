@@ -104,6 +104,10 @@ class EnvOutput:
             obs["extra_view_images"] if "extra_view_images" in obs else None
         )
         states = obs["states"] if "states" in obs else None
+        teacher_ids = obs["teacher_ids"] if "teacher_ids" in obs else None
+        reset_state_ids = (
+            obs["reset_state_ids"] if "reset_state_ids" in obs else None
+        )
         task_descriptions = (
             list(obs["task_descriptions"])
             if "task_descriptions" in obs and obs["task_descriptions"] is not None
@@ -115,6 +119,8 @@ class EnvOutput:
             "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
+            "teacher_ids": teacher_ids,
+            "reset_state_ids": reset_state_ids,
             "task_descriptions": task_descriptions,
         }
 
@@ -379,6 +385,7 @@ class Trajectory:
 
     max_episode_length: int = 0  # max episode length
     model_weights_id: str = ""  # str(uuid(versions))
+    rollout_block_idx: int = -1
     actions: torch.Tensor = None
     intervene_flags: torch.Tensor = None
     rewards: torch.Tensor = None
@@ -389,7 +396,6 @@ class Trajectory:
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
     forward_inputs: dict[str, Any] = field(default_factory=dict)
-
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
 
@@ -680,18 +686,22 @@ class EmbodiedRolloutResult:
         if len(self.forward_inputs) > 0:
             trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
             for key in trajectory.forward_inputs.keys():
-                trajectory.forward_inputs[key] = (
-                    trajectory.forward_inputs[key].cpu().contiguous()
-                )
+                value = trajectory.forward_inputs[key]
+                if isinstance(value, torch.Tensor):
+                    trajectory.forward_inputs[key] = value.cpu().contiguous()
 
         if len(self.curr_obs) > 0:
             trajectory.curr_obs = stack_list_of_dict_tensor(self.curr_obs)
             for key in trajectory.curr_obs.keys():
-                trajectory.curr_obs[key] = trajectory.curr_obs[key].cpu().contiguous()
+                value = trajectory.curr_obs[key]
+                if isinstance(value, torch.Tensor):
+                    trajectory.curr_obs[key] = value.cpu().contiguous()
         if len(self.next_obs) > 0:
             trajectory.next_obs = stack_list_of_dict_tensor(self.next_obs)
             for key in trajectory.next_obs.keys():
-                trajectory.next_obs[key] = trajectory.next_obs[key].cpu().contiguous()
+                value = trajectory.next_obs[key]
+                if isinstance(value, torch.Tensor):
+                    trajectory.next_obs[key] = value.cpu().contiguous()
 
         trajectory.model_weights_id = get_model_weights_id(
             trajectory.versions
@@ -729,6 +739,7 @@ class EmbodiedRolloutResult:
             )
             for i in range(split_size):
                 splited_trajectories[i].forward_inputs = splited_forward_inputs[i]
+
 
         for field_name in all_trajectory.__dataclass_fields__.keys():
             value = getattr(all_trajectory, field_name)
@@ -832,6 +843,7 @@ def convert_trajectories_to_batch(
             ]
             if tensors:
                 batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
+
 
     # -------- tensor fields --------
     reference_trajectory = trajectories[0]

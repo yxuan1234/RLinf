@@ -1,0 +1,71 @@
+# Evaluate an unmerged OPD FSDP checkpoint, restoring then merging VLM LoRA.
+defaults:
+  - /model/pi0_5@rollout.model
+  - override /hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: ${oc.env:OPD_GPU_PLACEMENT}
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: ../results
+    project_name: rlinf
+    experiment_name: libero_spatial_opd_vlm_lora_eval
+    logger_backends: [tensorboard]
+  max_epochs: 1
+  max_steps: -1
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+env:
+  group_name: EnvGroup
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 50
+    auto_reset: True
+    ignore_terminations: True
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 2400
+    group_size: 1
+    use_fixed_reset_state_ids: True
+    is_eval: True
+    task_id_filter: null
+    video_cfg:
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  recompute_logprobs: False
+  unnorm_key: libero_10
+  enable_offload: False
+  pipeline_stage_num: 1
+  model:
+    model_path: ${oc.env:PI05_SFT_MODEL_DIR}
+    checkpoint_path: ${oc.env:PI05_OPD_CHECKPOINT_DIR}
+    is_lora: True
+    lora_rank: 32
+    lora_scope: language_model
+    merge_lora_for_eval: True
+    num_action_chunks: 10
+    num_steps: 5
+    add_value_head: False
+    openpi:
+      norm_stats_dir: ${oc.env:PI05_SFT_MODEL_DIR}
+      train_expert_only: False
+      noise_method: flow_ode
+      joint_logprob: False
+      value_after_vlm: False

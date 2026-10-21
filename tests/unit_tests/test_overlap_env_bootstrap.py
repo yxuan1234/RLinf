@@ -91,6 +91,7 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
         self.worker.train_num_envs_per_stage = 2
         self.worker.n_train_chunk_steps = 2
         self.worker.rollout_epoch = 1
+        self.worker.train_rollout_epoch_schedule = []
         self.worker.enable_offload = False
         self.worker.train_enable_offload = False
         self.worker.use_training_pipeline = False
@@ -202,6 +203,25 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
             self.worker.prefetch_train_bootstrap(rollout_channel)
 
         self.assertIn("A prefetched train bootstrap already exists", str(cm.exception))
+
+    def test_scheduled_force_reset_replaces_carried_auto_reset_observation(self):
+        """A scheduled suite boundary must physically reset every local slot."""
+        reset_obs = {"main_images": torch.ones(2, 3, 224, 224)}
+        self.worker.env_list[0].reset.return_value = (reset_obs, {})
+
+        outputs = self.worker.bootstrap_step(force_reset=True)
+
+        self.worker.env_list[0].reset.assert_called_once_with()
+        self.assertIs(outputs[0].obs, reset_obs)
+        self.assertTrue(torch.equal(outputs[0].dones, torch.zeros(2, 4, dtype=torch.bool)))
+
+    def test_scheduled_finish_does_not_consume_unused_reset_ids(self):
+        """The following schedule block owns allocation of its initial IDs."""
+        self.worker.train_rollout_epoch_schedule = [{"name": "spatial"}]
+
+        self.worker.finish_rollout(mode="train")
+
+        self.worker.env_list[0].update_reset_state_ids.assert_not_called()
 
     def test_record_env_metrics_appends_values(self):
         """record_env_metrics should append env info tensors as-is."""

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 import random
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -71,6 +72,7 @@ class OpenPi0Config(Pi0Config):
     chunk_critic_input: bool = False  # use only the action chunk for critic estimation
     add_value_head: bool = False  # add value head for ppo
     value_after_vlm: bool = False  # value after vlm, pi05 mode
+    value_head_hidden_sizes: tuple | list | None = None
     value_vlm_mode: str = "mean_token"  # last_token, mean_token, first_token
 
     # ===== DSRL-specific parameters =====
@@ -153,7 +155,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             proj_width = 1024
         # value head
         if self.config.add_value_head:
-            if self.config.config_name in [
+            if self.config.value_head_hidden_sizes is not None:
+                value_head_hidden_sizes = tuple(self.config.value_head_hidden_sizes)
+            elif self.config.config_name in [
                 "pi05_maniskill",
                 "pi05_libero",
                 "pi05_droid_polaris",
@@ -467,35 +471,103 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         forward_inputs: dict[str, torch.Tensor],
         **kwargs,
     ) -> dict[str, Any]:
-        """Compute velocity v_theta at explicit (x_t, timesteps) for NFT loss."""
-        # obs process
-        observation = self.input_transform(forward_inputs, transpose=False)
-        observation = _model.Observation.from_dict(observation)
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=False)
-        )
-        # move device
-        device = next(self.parameters()).device
-        images = [img.to(device) for img in images]
-        img_masks = [m.to(device) for m in img_masks]
-        state = state.to(device)
-        # nft inputs
+        """Compute velocity at one or more explicit NFT timesteps.
+
+        A multi-step input has ``x_t`` shaped ``[B, S, H, D]`` and
+        ``timesteps`` shaped ``[B, S]``. The observation prefix is identical
+        across those ``S`` denoising steps, so its KV cache is built once and
+        reused for every action-expert suffix forward.
+        """
         nft_inputs = kwargs["nft_inputs"]
+        prefix_cache = nft_inputs.get("prefix_cache", None)
+        device = next(self.parameters()).device
+        if prefix_cache is None:
+            # The observation-dependent PaliGemma prefix is identical for all
+            # OPD timesteps in a micro-batch. Build it once and optionally
+            # return it so expert-only training can stream suffix
+            # forward/backward passes without recomputing the prefix.
+            observation = self.input_transform(forward_inputs, transpose=False)
+            observation = _model.Observation.from_dict(observation)
+            images, img_masks, lang_tokens, lang_masks, state = (
+                self._preprocess_observation(observation, train=False)
+            )
+            images = [img.to(device) for img in images]
+            img_masks = [m.to(device) for m in img_masks]
+            state = state.to(device)
+            prefix_output, prefix_pad_masks, past_key_values = (
+                self._build_prefix_cache(images, img_masks, lang_tokens, lang_masks)
+            )
+            prefix_cache = {
+                "state": state,
+                "prefix_pad_masks": prefix_pad_masks,
+                "past_key_values": past_key_values,
+            }
+        else:
+            state = prefix_cache["state"]
+            prefix_pad_masks = prefix_cache["prefix_pad_masks"]
+            past_key_values = prefix_cache["past_key_values"]
+
         x_t = nft_inputs["x_t"].to(device)
         t = nft_inputs["timesteps"].to(device)
-        # get v_theta
-        _, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
-        )
+        if (
+            os.environ.get("DEBUG_CONDITION", "0") == "1"
+            and "prefix_output" in locals()
+        ):
+            self._debug_prefix_output = prefix_output.detach().float().cpu()
+            self._debug_prefix_kv = [
+                (k.detach().float().cpu(), v.detach().float().cpu())
+                for k, v in zip(
+                    past_key_values.key_cache,
+                    past_key_values.value_cache,
+                )
+            ]
         compute_values = kwargs.get("compute_values", False)
-        v_theta, suffix_out = self.get_velocity(
-            state, x_t, t, prefix_pad_masks, past_key_values
-        )
-        v_theta = v_theta[:, : self.config.action_chunk, :]
+        if x_t.ndim == 4:
+            if t.ndim != 2 or t.shape[:2] != x_t.shape[:2]:
+                raise ValueError(
+                    "Multi-step NFT expects timesteps shaped [B, S], got "
+                    f"x_t={tuple(x_t.shape)}, timesteps={tuple(t.shape)}."
+                )
+            velocities = []
+            suffix_outputs = []
+            for step_idx in range(x_t.shape[1]):
+                step_velocity, step_suffix = self.get_velocity(
+                    state,
+                    x_t[:, step_idx],
+                    t[:, step_idx],
+                    prefix_pad_masks,
+                    past_key_values,
+                )
+                velocities.append(step_velocity[:, : self.config.action_chunk, :])
+                if compute_values and self.config.add_value_head:
+                    suffix_outputs.append(step_suffix)
+            v_theta = torch.stack(velocities, dim=1)
+            suffix_out = None
+        elif x_t.ndim == 3:
+            v_theta, suffix_out = self.get_velocity(
+                state, x_t, t, prefix_pad_masks, past_key_values
+            )
+            v_theta = v_theta[:, : self.config.action_chunk, :]
+        else:
+            raise ValueError(
+                "NFT x_t must have shape [B, H, D] or [B, S, H, D], got "
+                f"{tuple(x_t.shape)}."
+            )
         # result
         result: dict[str, Any] = {"v_theta": v_theta, "x_t": x_t, "timesteps": t}
+        if nft_inputs.get("return_prefix_cache", False):
+            result["prefix_cache"] = prefix_cache
         if compute_values and self.config.add_value_head:
-            result["values"] = self._compute_value_from_suffix(suffix_out)[:, None]
+            if x_t.ndim == 4:
+                result["values"] = torch.stack(
+                    [
+                        self._compute_value_from_suffix(step_suffix)
+                        for step_suffix in suffix_outputs
+                    ],
+                    dim=1,
+                )
+            else:
+                result["values"] = self._compute_value_from_suffix(suffix_out)[:, None]
         return result
 
     def obs_processor(self, env_obs):
@@ -620,6 +692,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             {k: v for k, v in to_process_obs.items() if k != "prompt"}
         )
         forward_inputs.update(cloned_obs)
+        teacher_ids = env_obs.get("teacher_ids", None)
+        if torch.is_tensor(teacher_ids):
+            forward_inputs["teacher_ids"] = teacher_ids.clone().contiguous()
+        reset_state_ids = env_obs.get("reset_state_ids", None)
+        if torch.is_tensor(reset_state_ids):
+            forward_inputs["reset_state_ids"] = reset_state_ids.clone().contiguous()
 
         result = {
             "prev_logprobs": prev_logprobs,

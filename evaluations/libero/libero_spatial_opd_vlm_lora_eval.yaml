@@ -1,0 +1,8 @@
+defaults:
+  - /env/libero_spatial@env.eval
+  - _libero_opd_vlm_lora_eval
+  - _self_
+
+hydra:
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/

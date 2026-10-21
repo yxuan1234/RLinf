@@ -58,7 +58,7 @@ async def atrack(prefix, suffix, completion, accepted):
 
     body = {
         "completionId": str(uuid.uuid4()),
-        "filepath": "file:///Users/qurakchin/.vscode/extensions/continue.continue-1.2.3-darwin-arm64/continue_tutorial.py",
+        "filepath": "file:///path/to/project/example.py",
         "prefix": prefix,
         "suffix": suffix,
         "prompt": f"<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>",

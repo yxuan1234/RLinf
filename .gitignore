@@ -21,3 +21,12 @@ rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
 .claude/settings.json
+
+# Local runtime artifacts must not enter release archives.
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv*/
+/third_party/
+.env
+.env.local

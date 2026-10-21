@@ -130,6 +130,9 @@ def concat_batch(data1, data2):
                     )
                 continue
             batch[key] = concat_batch(data1[key], data2[key])
+        elif isinstance(value, list):
+            if key in data2 and isinstance(data2[key], list):
+                batch[key] = value + data2[key]
     return batch
 
 
@@ -147,6 +150,9 @@ def stack_list_of_dict_tensor(list_of_dict: list, dim=0):
         elif isinstance(_v0, dict):
             v_list = [d[key] for d in list_of_dict]
             ret[key] = stack_list_of_dict_tensor(v_list)
+        elif isinstance(_v0, list):
+            assert dim == 0, f"{key=}, list dim !=0 is not supported!"
+            ret[key] = [item for sub in list_of_dict for item in sub[key]]
         elif _v0 is None:
             pass
         else:

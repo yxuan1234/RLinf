@@ -1,0 +1,17 @@
+defaults:
+  - /env/libero_goal@env.eval
+  - _libero_opd_vlm_lora_eval
+  - _self_
+
+hydra:
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+runner:
+  logger:
+    experiment_name: libero_goal_opd_vlm_lora_eval
+env:
+  eval:
+    total_num_envs: 50
+    max_episode_steps: 320
+    max_steps_per_rollout_epoch: 3200

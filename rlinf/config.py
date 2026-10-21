@@ -918,6 +918,41 @@ def validate_embodied_cfg(cfg):
             f"Current value: {add_value_head}"
         )
 
+    raw_rollout_schedule = algorithm_cfg.get("rollout_epoch_schedule", None)
+    use_rollout_epoch_schedule = (
+        not only_eval
+        and raw_rollout_schedule is not None
+        and str(algorithm_cfg.get("loss_type", "")) == "embodied_opd"
+    )
+
+    if use_rollout_epoch_schedule:
+        assert len(raw_rollout_schedule) > 0, (
+            "algorithm.rollout_epoch_schedule must contain at least one block."
+        )
+        assert int(cfg.env.train.rollout_epoch) % len(raw_rollout_schedule) == 0, (
+            "env.train.rollout_epoch must either match rollout_epoch_schedule "
+            "length or be an integer multiple of it: "
+            f"{int(cfg.env.train.rollout_epoch)} vs {len(raw_rollout_schedule)}."
+        )
+        for block_idx, block_cfg in enumerate(raw_rollout_schedule):
+            max_steps_per_rollout_epoch = block_cfg.get(
+                "max_steps_per_rollout_epoch", None
+            )
+            assert max_steps_per_rollout_epoch is not None, (
+                "Each rollout_epoch_schedule block must set "
+                "max_steps_per_rollout_epoch. "
+                f"Missing at block {block_idx}."
+            )
+            max_steps_per_rollout_epoch = int(max_steps_per_rollout_epoch)
+            assert (
+                max_steps_per_rollout_epoch % cfg.actor.model.num_action_chunks == 0
+            ), (
+                "rollout_epoch_schedule["
+                f"{block_idx}].max_steps_per_rollout_epoch="
+                f"{max_steps_per_rollout_epoch} must be divisible by "
+                f"actor.model.num_action_chunks={cfg.actor.model.num_action_chunks}."
+            )
+
     # process num-envs
     component_placement = HybridComponentPlacement(cfg, Cluster())
     stage_num = cfg.rollout.pipeline_stage_num

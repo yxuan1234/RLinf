@@ -1,7 +1,8 @@
 defaults:
-  - env/libero_spatial@env.eval
-  - model/dreamzero_5b@rollout.model
-  - override hydra/job_logging: stdout
+  - /env/libero_spatial@env.eval
+  - /model/dreamzero_5b@rollout.model
+  - override /hydra/job_logging: stdout
+  - _self_
 
 hydra:
   run:

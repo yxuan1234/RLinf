@@ -6,9 +6,58 @@ export EVALUATIONS_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export REPO_PATH="$(dirname "$EVALUATIONS_PATH")"
 export EMBODIED_PATH="${REPO_PATH}/examples/embodiment"
 export SRC_FILE="${EVALUATIONS_PATH}/eval_embodied_agent.py"
+export RAY_BIN="${RAY_BIN:-ray}"
+export RAY_PORT="${RAY_PORT:-6669}"
+export DASHBOARD_PORT="${DASHBOARD_PORT:-8992}"
+export RAY_START_LOG="${RAY_START_LOG:-${REPO_PATH}/logs/ray_eval_start.log}"
 
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 export HYDRA_FULL_ERROR=1
+
+cleanup_ray() {
+    echo "[INFO] Cleaning old Ray processes..."
+    "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
+    pkill -9 -f "raylet|gcs_server|dashboard|monitor.py|runtime_env|plasma" >/dev/null 2>&1 || true
+    rm -rf /tmp/ray /dev/shm/ray >/dev/null 2>&1 || true
+    sleep 5
+}
+
+wait_ray_ready() {
+    local retries="${1:-60}"
+    local interval="${2:-2}"
+
+    for ((i=1; i<=retries; i++)); do
+        if "${RAY_BIN}" status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep "${interval}"
+    done
+
+    return 1
+}
+
+start_ray() {
+    echo "[INFO] Starting Ray head on port ${RAY_PORT}..."
+    mkdir -p "${REPO_PATH}/logs"
+    "${RAY_BIN}" start --head \
+        --port="${RAY_PORT}" \
+        --dashboard-port="${DASHBOARD_PORT}" \
+        --include-dashboard=True \
+        --disable-usage-stats \
+        >"${RAY_START_LOG}" 2>&1
+
+    if wait_ray_ready 60 2; then
+        echo "[INFO] Ray cluster is ready."
+    else
+        echo "[ERROR] Ray cluster failed to become healthy."
+        echo "========== ${RAY_START_LOG} =========="
+        cat "${RAY_START_LOG}" || true
+        echo "====================================="
+        exit 1
+    fi
+
+    sleep 5
+}
 
 setup_sim_env() {
     export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
@@ -172,6 +221,11 @@ if [ "${BENCHMARK}" != "realworld" ]; then
     setup_sim_env
 fi
 
+if [ "${RESTART_RAY:-1}" = "1" ]; then
+    cleanup_ray
+    start_ray
+fi
+
 if [ "${BENCHMARK}" = "libero" ]; then
     export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"
     export LIBERO_TYPE="${LIBERO_TYPE:-standard}"
@@ -190,7 +244,7 @@ else
 fi
 
 echo "Using Python at $(which python)"
-LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
+LOG_DIR="${EVAL_LOG_DIR:-${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}}"
 
 MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
 
